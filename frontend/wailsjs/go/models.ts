@@ -69,7 +69,12 @@ export namespace mail {
 	    uid: number;
 	    subject: string;
 	    from: string;
+	    to: string;
+	    cc: string;
+	    bcc: string;
+	    replyTo: string;
 	    date: string;
+	    messageID: string;
 	    html: string;
 	    text: string;
 	    attachments: Attachment[];
@@ -83,7 +88,12 @@ export namespace mail {
 	        this.uid = source["uid"];
 	        this.subject = source["subject"];
 	        this.from = source["from"];
+	        this.to = source["to"];
+	        this.cc = source["cc"];
+	        this.bcc = source["bcc"];
+	        this.replyTo = source["replyTo"];
 	        this.date = source["date"];
+	        this.messageID = source["messageID"];
 	        this.html = source["html"];
 	        this.text = source["text"];
 	        this.attachments = this.convertValues(source["attachments"], Attachment);
@@ -165,6 +175,7 @@ export namespace store {
 	    subject: string;
 	    preview: string;
 	    body: string;
+	    bodyHTML: boolean;
 	    date: string;
 	    avatar: string;
 	    unread: boolean;
@@ -185,6 +196,7 @@ export namespace store {
 	        this.subject = source["subject"];
 	        this.preview = source["preview"];
 	        this.body = source["body"];
+	        this.bodyHTML = source["bodyHTML"];
 	        this.date = source["date"];
 	        this.avatar = source["avatar"];
 	        this.unread = source["unread"];

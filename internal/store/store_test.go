@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -68,6 +69,109 @@ func TestSearchFTSAndFallback(t *testing.T) {
 		t.Fatalf("fallback errored: %v", err)
 	}
 	_ = got
+}
+
+func TestCachedBodyKeepsFormatAndSearchIndex(t *testing.T) {
+	s := openTest(t)
+	msg := Message{Account: "a@x.com", Folder: "inbox", UID: 9, From: "Ada", FromEmail: "ada@example.com", Subject: "Status"}
+	if err := s.SaveMessages([]Message{msg}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateBody(msg.Account, msg.Folder, msg.UID, msg.Subject, "<p>Cached update</p>", true); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := s.CachedMessage(msg.Account, msg.Folder, msg.UID)
+	if err != nil || cached == nil || !cached.BodyHTML || cached.Body != "<p>Cached update</p>" {
+		t.Fatalf("cached body wrong: %+v, %v", cached, err)
+	}
+	got, err := s.ListMessages(msg.Account, msg.Folder, "cached", 10)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("cached body was not indexed: %+v, %v", got, err)
+	}
+}
+
+func TestOpenMigratesExistingMessageCache(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account TEXT, folder TEXT, uid INTEGER,
+		from_addr TEXT, from_email TEXT, to_addr TEXT,
+		subject TEXT, preview TEXT, body TEXT,
+		date_str TEXT, avatar TEXT, unread INTEGER,
+		UNIQUE(account, folder, uid)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := Message{Account: "a@x.com", Folder: "inbox", UID: 1, Subject: "Old cache"}
+	if err := s.SaveMessages([]Message{msg}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateBody(msg.Account, msg.Folder, msg.UID, msg.Subject, "<p>migrated</p>", true); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := s.CachedMessage(msg.Account, msg.Folder, msg.UID)
+	if err != nil || cached == nil || !cached.BodyHTML {
+		t.Fatalf("migration did not add body_html: %+v, %v", cached, err)
+	}
+}
+
+func TestSaveMessagesUpsertRefreshesFTS(t *testing.T) {
+	s := openTest(t)
+	account, folder := "a@x.com", "inbox"
+	cases := []struct {
+		name  string
+		batch []Message
+		query string
+		want  int
+	}{
+		{
+			name:  "insert indexes subject",
+			batch: []Message{{Account: account, Folder: folder, UID: 7, From: "Boss", Subject: "Draft contract"}},
+			query: "draft",
+			want:  1,
+		},
+		{
+			name:  "upsert replaces old FTS row",
+			batch: []Message{{Account: account, Folder: folder, UID: 7, From: "Boss", Subject: "Signed contract"}},
+			query: "draft",
+			want:  0,
+		},
+		{
+			name:  "upsert indexes replacement subject",
+			batch: []Message{{Account: account, Folder: folder, UID: 7, From: "Boss", Subject: "Signed contract"}},
+			query: "signed",
+			want:  1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.SaveMessages(tc.batch); err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.ListMessages(account, folder, tc.query, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != tc.want {
+				t.Fatalf("query %q: got %d rows, want %d", tc.query, len(got), tc.want)
+			}
+		})
+	}
+	rows, err := s.ListMessages(account, folder, "", 10)
+	if err != nil || len(rows) != 1 || rows[0].UID != 7 {
+		t.Fatalf("upsert created duplicate message rows: %+v, %v", rows, err)
+	}
 }
 
 func TestDeleteAccount(t *testing.T) {

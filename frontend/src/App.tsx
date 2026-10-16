@@ -84,15 +84,19 @@ export default function App() {
   const [folderTotals, setFolderTotals] = useState<Record<string, number>>({});
   const [loadingMore, setLoadingMore] = useState(false);
   const [exhausted, setExhausted] = useState(false);
+  const activeFolderRef = useRef(activeFolder);
+  useEffect(() => { activeFolderRef.current = activeFolder; }, [activeFolder]);
 
   const loadOlder = async () => {
     if (!inWails() || !activeEmail || loadingMore || exhausted || !hasMore || serverMails.length === 0) return;
     setLoadingMore(true);
     try {
+      const folder = activeFolder;
       const before = serverMails.length;
       const minUid = Math.min(...serverMails.map((m: any) => m.uid).filter((u: any) => u > 0));
       if (!isFinite(minUid)) return;
-      const mails = await FetchOlder(activeEmail, activeFolder, minUid);
+      const mails = await FetchOlder(activeEmail, folder, minUid);
+      if (activeFolderRef.current !== folder) return;
       if (!mails || mails.length <= before) {
         setExhausted(true); // server has nothing new to give
       }
@@ -109,23 +113,23 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [fullBody, setFullBody] = useState<any>(null);
   const [bodyLoading, setBodyLoading] = useState(false);
-  const [showRemote, setShowRemote] = useState(() => localStorage.getItem('emailclient:showRemote') === '1');
+  const [showMessageDetails, setShowMessageDetails] = useState(false);
+  const [showRemote, setShowRemote] = useState(() => localStorage.getItem('emailclient:showRemote') !== '0');
 
-  const toggleRemote = (v: boolean) => { setShowRemote(v); localStorage.setItem('emailclient:showRemote', v ? '1' : '0'); };
+  const toggleRemote = () => setShowRemote((enabled) => {
+    localStorage.setItem('emailclient:showRemote', enabled ? '0' : '1');
+    return !enabled;
+  });
 
-  // sanitized HTML with remote images blocked unless enabled (tracking-pixel safe)
+  // Sanitized HTML; remote images are shown unless switched off in the header.
   const cleanHtml = useMemo(() => {
     const raw = (fullBody as any)?.html || '';
     let out = DOMPurify.sanitize(raw, { ADD_ATTR: ['target'] });
     if (!showRemote) {
-      out = out.replace(/<img\b([^>]*?)\bsrc\s*=\s*(["'])https?:[^"']*\2([^>]*)>/gi, '<img$1$3 data-remote-blocked="1" alt="Blocked remote image">');
+      out = out.replace(/<img\b[^>]*\bsrc\s*=\s*(["'])https?:[^"']*\1[^>]*>/gi, '');
     }
     return out;
   }, [fullBody, showRemote]);
-  const remoteBlocked = useMemo(
-    () => !showRemote && /data-remote-blocked="1"/.test(cleanHtml),
-    [cleanHtml, showRemote]
-  );
 
   const openLink = (e: React.MouseEvent) => {
     const a = (e.target as HTMLElement).closest?.('a[href]') as HTMLAnchorElement | null;
@@ -249,7 +253,10 @@ export default function App() {
     StartWatch(activeEmail).catch(() => {});
     const off = EventsOn('mail:inbox', () => {
       setExhausted(false);
-      FetchMail(activeEmail, activeFolder).then((m) => { if (m) setServerMails(m); }).catch(() => {});
+      const folder = activeFolderRef.current;
+      FetchMail(activeEmail, folder).then((m) => {
+        if (m && activeFolderRef.current === folder) setServerMails(m);
+      }).catch(() => {});
       loadCounts(activeEmail);
     });
     return () => { EventsOff('mail:inbox'); off(); StopWatch(activeEmail); };
@@ -259,14 +266,19 @@ export default function App() {
     setExhausted(false);
     setSelectedId('');
     setFullBody(null);
-    FetchMail(activeEmail, activeFolder).then((m) => { if (m) setServerMails(m); }).catch(() => {});
-    StartBackfill(activeEmail, activeFolder);
+    setServerMails([]);
+    const folder = activeFolder;
+    FetchMail(activeEmail, folder).then((m) => {
+      if (m && activeFolderRef.current === folder) setServerMails(m);
+    }).catch(() => {});
+    StartBackfill(activeEmail, folder);
   }, [activeFolder]);
 
   // load full MIME body when selection changes (live accounts only)
   const markedRead = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!inWails() || !activeEmail || !selectedId) { setFullBody(null); return; }
+    setShowMessageDetails(false);
     const uid = Number(selectedId);
     if (!uid) return; // mock ids are non-numeric
     setBodyLoading(true);
@@ -299,6 +311,7 @@ export default function App() {
         avatar: m.avatar || (m.from || '?').slice(0, 1).toUpperCase(),
         unread: !!m.unread,
         folder: m.folder || activeFolder,
+        to: m.to || activeEmail,
       }))
     : mockEmails;
 
@@ -306,8 +319,7 @@ export default function App() {
     const { ops, text } = parseSearch(query);
     const t = text.toLowerCase();
     return source.filter((e: any) => {
-      // live rows arrive folder-scoped from FetchMail/ListCached; mock rows need the check
-      if (!live && e.folder !== activeFolder) return false;
+      if (e.folder !== activeFolder) return false;
       if (ops.from && !(e.from || '').toLowerCase().includes(ops.from.toLowerCase())) return false;
       if (ops.subject && !(e.subject || '').toLowerCase().includes(ops.subject.toLowerCase())) return false;
       if (ops.to && !((e.to || '').toLowerCase().includes(ops.to.toLowerCase()))) return false;
@@ -512,6 +524,19 @@ export default function App() {
           <button className="p-2 hover:bg-neutral-100 rounded-full"><HelpCircle size={17} /></button>
           <span className="w-px h-5 bg-black/10 mx-1" />
           <button onClick={doRefresh} title="Refresh" className="p-2 hover:bg-neutral-100 rounded-full"><RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} /></button>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showRemote}
+            onClick={toggleRemote}
+            title={showRemote ? 'Remote images: on' : 'Remote images: off'}
+            className="flex items-center gap-1.5 rounded-full px-2 py-1.5 hover:bg-neutral-100"
+          >
+            <span className="hidden lg:inline text-[11px] font-medium">Images</span>
+            <span className={`relative h-4 w-7 rounded-full transition-colors ${showRemote ? 'bg-violet-600' : 'bg-neutral-300'}`}>
+              <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow-sm transition-transform ${showRemote ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+            </span>
+          </button>
           <button onClick={openSettings} title="Settings" className="p-2 hover:bg-neutral-100 rounded-full"><Settings size={17} /></button>
           <button
             onClick={() => setAccountOpen(true)}
@@ -600,8 +625,8 @@ export default function App() {
         </section>
 
         {/* READER */}
-        <main className="flex-1 min-w-0 bg-[#efedf1] flex flex-col">
-          <div className="flex items-center gap-1 px-4 py-2.5 bg-[#efedf1] border-b border-black/5 text-neutral-600">
+        <main className="flex-1 min-w-0 bg-[#fafafa] flex flex-col">
+          <div className="flex items-center gap-1 px-5 py-2.5 bg-white border-b border-black/10 text-neutral-600">
             <button title="Reply" onClick={() => openCompose('reply')} className="p-2 hover:bg-black/5 rounded-md"><Reply size={16} /></button>
             <button title="Reply all" onClick={() => openCompose('reply')} className="p-2 hover:bg-black/5 rounded-md"><ReplyAll size={16} /></button>
             <button title="Forward" onClick={() => openCompose('forward')} className="p-2 hover:bg-black/5 rounded-md"><Forward size={16} /></button>
@@ -610,17 +635,47 @@ export default function App() {
               <button key={i} className="p-2 hover:bg-black/5 rounded-md"><Icon size={16} /></button>
             ))}
           </div>
-          <div className="flex-1 overflow-y-auto px-8 py-5">
-            <h1 className="text-[22px] font-bold mb-4">{selected?.subject || (live ? 'Mailbox' : '')}</h1>
-            <div className="bg-white rounded-2xl shadow-sm p-0 overflow-hidden">
+          <div className="flex-1 overflow-y-auto px-5 py-5">
+            <h1 className="mx-auto mb-4 w-full max-w-[980px] text-[22px] font-bold tracking-tight">{selected?.subject || (live ? 'Mailbox' : '')}</h1>
+            <div className="mx-auto w-full max-w-[980px] bg-white rounded-[20px] border border-black/[0.03] shadow-sm overflow-hidden">
               {live && selected ? (
-              <div className="flex items-center gap-3 px-6 py-4">
+              <>
+              <div className="flex items-start gap-3 px-6 py-5">
                 <div className="w-10 h-10 rounded-full bg-violet-100 text-violet-700 flex items-center justify-center font-semibold text-lg">{(selected.from || '?').slice(0, 1).toUpperCase()}</div>
-                <div>
-                  <div className="text-[14px]"><b>{selected.from}</b></div>
-                  <div className="text-[13px] text-neutral-500">{selected.date}</div>
+                <div className="min-w-0">
+                  <div className="truncate text-[14px]"><b>{(fullBody as any)?.from || selected.from}</b></div>
+                  <button
+                    type="button"
+                    onClick={() => setShowMessageDetails((open) => !open)}
+                    className="flex max-w-full items-center gap-1 truncate text-[13px] text-neutral-500 hover:text-neutral-800"
+                    aria-expanded={showMessageDetails}
+                  >
+                    <span className="truncate">To: {(fullBody as any)?.to || selected.to}</span>
+                    <ChevronDown size={14} className={`shrink-0 transition-transform ${showMessageDetails ? 'rotate-180' : ''}`} />
+                  </button>
                 </div>
+                <div className="ml-auto shrink-0 pt-1 text-[12px] text-neutral-500">{selected.date}</div>
               </div>
+              {showMessageDetails && (
+                <dl className="grid gap-x-4 gap-y-2 border-t border-black/5 px-6 py-4 text-[13px] sm:grid-cols-[72px_minmax(0,1fr)]">
+                  {[
+                    ['From', (fullBody as any)?.from || selected.from],
+                    ['To', (fullBody as any)?.to || selected.to],
+                    ['Cc', (fullBody as any)?.cc],
+                    ['Bcc', (fullBody as any)?.bcc],
+                    ['Reply-To', (fullBody as any)?.replyTo],
+                    ['Subject', (fullBody as any)?.subject || selected.subject],
+                    ['Date', (fullBody as any)?.date || selected.date],
+                    ['Message-ID', (fullBody as any)?.messageID],
+                  ].filter(([, value]) => value).map(([label, value]) => (
+                    <div key={label} className="contents">
+                      <dt className="font-medium text-neutral-500">{label}</dt>
+                      <dd className="min-w-0 break-words text-neutral-800">{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+              </>
               ) : (
               <div className="flex items-center gap-3 px-6 py-4">
                 <div className="w-10 h-10 rounded-full bg-violet-100 text-violet-700 flex items-center justify-center font-semibold text-lg">S</div>
@@ -636,7 +691,7 @@ export default function App() {
               )}
               {/* Attachments (live accounts) */}
               {live && fullBody?.attachments?.length > 0 && (
-                <div className="mx-6 mb-3">
+                <div className="px-6 pb-4">
                   <div className="flex flex-wrap gap-2">
                     {fullBody.attachments.map((a: any, i: number) => {
                       const url = a.data ? `data:${a.mime || 'application/octet-stream'};base64,${a.data}` : '';
@@ -660,25 +715,21 @@ export default function App() {
               )}
               {/* Live body (sanitized) for real accounts; static hero for mock */}
               {liveBody ? (
-                <div className="mx-6 mb-6 bg-white rounded-sm overflow-hidden">
+                <div className="border-t border-black/5 px-6 py-6">
                   {bodyLoading && !fullBody ? (
-                    <div className="px-8 py-10 text-sm text-neutral-500">Loading message…</div>
+                    <div className="py-10 text-sm text-neutral-500">Loading message…</div>
                   ) : (fullBody as any)?.html ? (
-                    <>
-                      {remoteBlocked && (
-                        <div className="mx-8 mt-4 flex items-center gap-2 text-[13px] bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-3 py-2">
-                          <ShieldCheck size={14} /> Images blocked to protect your privacy.
-                          <button onClick={() => toggleRemote(true)} className="ml-auto font-semibold underline">Load images</button>
-                        </div>
-                      )}
-                      <div
-                        className="px-8 py-6 text-[14px] leading-relaxed prose max-w-none"
-                        onClick={openLink}
-                        dangerouslySetInnerHTML={{ __html: cleanHtml }}
-                      />
-                    </>
+                    <div
+                      className="email-html overflow-x-auto text-[14px] leading-relaxed"
+                      onClick={openLink}
+                      onErrorCapture={(event) => {
+                        const image = event.target as HTMLElement;
+                        if (image.tagName === 'IMG') image.style.display = 'none';
+                      }}
+                      dangerouslySetInnerHTML={{ __html: cleanHtml }}
+                    />
                   ) : (
-                    <pre className="px-8 py-6 text-[13px] whitespace-pre-wrap font-sans">{(fullBody as any)?.text || 'No body.'}</pre>
+                    <pre className="text-[13px] whitespace-pre-wrap font-sans">{(fullBody as any)?.text || 'No body.'}</pre>
                   )}
                 </div>
               ) : !activeEmail ? (
@@ -709,6 +760,16 @@ export default function App() {
                   {filtered.length ? 'Select a message to read it.' : 'No messages here yet.'}
                 </div>
               </div>
+              )}
+              {live && selected && !bodyLoading && (
+                <div className="flex items-center justify-between gap-3 border-t border-black/5 px-6 py-4">
+                  <div className="flex flex-wrap items-center gap-4 text-[13px] font-semibold text-violet-700">
+                    <button onClick={() => openCompose('reply')} className="flex items-center gap-1.5 hover:text-violet-900"><Reply size={15} /> Reply</button>
+                    <button onClick={() => openCompose('reply')} className="flex items-center gap-1.5 hover:text-violet-900"><ReplyAll size={15} /> Reply all</button>
+                    <button onClick={() => openCompose('forward')} className="flex items-center gap-1.5 hover:text-violet-900"><Forward size={15} /> Forward</button>
+                  </div>
+                  <button className="flex shrink-0 items-center gap-1.5 text-[13px] font-medium text-neutral-700 hover:text-black"><Ban size={15} /> Mark as spam</button>
+                </div>
               )}
             </div>
           </div>
@@ -804,11 +865,6 @@ export default function App() {
                 </div>
               ))}
             </div>
-            <div className="mt-4 text-sm font-semibold">Reading</div>
-            <label className="mt-1.5 flex items-center gap-2 text-[13px] cursor-pointer">
-              <input type="checkbox" checked={showRemote} onChange={(e) => toggleRemote(e.target.checked)} className="accent-violet-600" />
-              Load remote images by default
-            </label>
             <div className="mt-4 text-sm font-semibold">Storage</div>
             <div className="text-[13px] text-neutral-500 mt-1">
               {storage ? `${storage.messages} messages cached (${(storage.bytes / 1048576).toFixed(1)} MB)` : '…'}

@@ -233,7 +233,9 @@ func (a *App) RefreshAll(email string) map[string]int {
 				Date: s.Date, Avatar: avatar, Unread: s.Unread,
 			})
 		}
-		_ = a.store.SaveMessages(msgs)
+		if err := a.store.SaveMessages(msgs); err != nil {
+			log.Printf("refresh %s/%s: cache save failed: %v", email, f.Key, err)
+		}
 		out[f.Key] = f.Unseen
 	}
 	return out
@@ -264,21 +266,10 @@ func (a *App) FetchMail(email, folder string) []store.Message {
 		log.Printf("fetch %s/%s: server error (%v), serving cache", email, mbox, err)
 		return a.ListCached(email, folder, "")
 	}
-	if err := a.ensureStore(); err == nil {
-		var msgs []store.Message
-		for _, s := range sums {
-			avatar := "?"
-			if s.From != "" {
-				avatar = strings.ToUpper(string([]rune(s.From)[0]))
-			}
-			msgs = append(msgs, store.Message{
-				Account: email, Folder: folder, UID: s.UID,
-				From: s.From, FromEmail: email, To: email,
-				Subject: s.Subject, Preview: s.Subject,
-				Date: s.Date, Avatar: avatar, Unread: s.Unread,
-			})
-		}
-		_ = a.store.SaveMessages(msgs)
+	if err := a.ensureStore(); err != nil {
+		log.Printf("fetch %s/%s: cache unavailable: %v", email, folder, err)
+	} else {
+		a.saveSummaries(email, folder, sums)
 	}
 	cached := a.ListCached(email, folder, "")
 	log.Printf("fetch %s/%s: server gave %d, cache now holds %d", email, mbox, len(sums), len(cached))
@@ -501,9 +492,28 @@ func (a *App) GetMessage(email, folder string, uid uint32) *mail.Full {
 	if folder == "" {
 		folder = "inbox"
 	}
+	var cached *store.Message
+	if err := a.ensureStore(); err == nil {
+		cached, _ = a.store.CachedMessage(email, folder, uid)
+	}
+	cachedFull := func() *mail.Full {
+		if cached == nil || cached.Body == "" {
+			return nil
+		}
+		full := &mail.Full{UID: uid, Subject: cached.Subject, From: cached.FromEmail, To: email, Date: cached.Date}
+		if full.From == "" {
+			full.From = cached.From
+		}
+		if cached.BodyHTML {
+			full.HTML = cached.Body
+		} else {
+			full.Text = cached.Body
+		}
+		return full
+	}
 	secret, useOAuth := getAuth(email)
 	if secret == "" {
-		return nil
+		return cachedFull()
 	}
 	cfg := cfgFor(email)
 	var mbox string
@@ -517,14 +527,16 @@ func (a *App) GetMessage(email, folder string, uid uint32) *mail.Full {
 		full, err = mail.GetFull(cfg, email, secret, mbox, uid)
 	}
 	if err != nil || full == nil {
-		return nil
+		return cachedFull()
 	}
 	if err := a.ensureStore(); err == nil {
-		body := full.HTML
-		if body == "" {
-			body = full.Text
+		body, bodyHTML := full.Text, false
+		if full.HTML != "" {
+			body, bodyHTML = full.HTML, true
 		}
-		_ = a.store.UpdateBody(email, folder, uid, full.Subject, body)
+		if err := a.store.UpdateBody(email, folder, uid, full.Subject, body, bodyHTML); err != nil {
+			log.Printf("message %s/%s UID %d: cache body failed: %v", email, folder, uid, err)
+		}
 		_ = a.store.MarkRead(email, folder, uid, false)
 	}
 	return full
@@ -713,7 +725,9 @@ func (a *App) watchLoop(ctx context.Context, email string) {
 							Date: s.Date, Avatar: avatar, Unread: s.Unread,
 						})
 					}
-					_ = a.store.SaveMessages(msgs)
+					if err := a.store.SaveMessages(msgs); err != nil {
+						log.Printf("watch %s/inbox: cache save failed: %v", email, err)
+					}
 					unread := a.store.CountUnread(email, "inbox")
 					a.watchMu.Lock()
 					if a.lastUnread == nil {

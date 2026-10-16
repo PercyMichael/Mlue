@@ -16,6 +16,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomsg "github.com/emersion/go-message"
+	_ "github.com/emersion/go-message/charset"
 	gomailparse "github.com/emersion/go-message/mail"
 
 	"emailclient/internal/autoconfig"
@@ -350,7 +351,8 @@ func fetchSummariesUID(c *imapclient.Client, uidHi uint32, limit int) ([]Summary
 		}
 		part, err := fetchRange(c, lo, hi)
 		if err != nil {
-			log.Printf("fetch %d-%d: chunk failed (%v), continuing lower", lo, hi, err)
+			out = append(out, part...)
+			log.Printf("fetch %d-%d: chunk failed after %d summaries (%v), continuing lower", lo, hi, len(part), err)
 			if lo == 1 {
 				break
 			}
@@ -382,50 +384,59 @@ func fetchRange(c *imapclient.Client, lo, hi uint32) ([]Summary, error) {
 	defer fetch.Close()
 
 	var out []Summary
-	var skipped int
-	var skippedUIDs []uint32
+	var incomplete int
+	var incompleteUIDs []uint32
 	for {
 		msg := fetch.Next()
 		if msg == nil {
 			break
 		}
 		buf, err := msg.Collect()
-		if err != nil || buf == nil || buf.Envelope == nil {
-			skipped++
-			if buf != nil && len(skippedUIDs) < 8 {
-				skippedUIDs = append(skippedUIDs, uint32(buf.UID))
-			}
+		summary, ok := summaryFromBuffer(buf)
+		if !ok {
+			log.Printf("fetch %d-%d: dropping response without a UID: %v", lo, hi, err)
 			continue
 		}
-		from := ""
-		if len(buf.Envelope.From) > 0 {
-			a := buf.Envelope.From[0]
-			from = a.Name
-			if from == "" {
-				from = a.Addr()
+		if err != nil || buf.Envelope == nil {
+			incomplete++
+			if len(incompleteUIDs) < 8 {
+				incompleteUIDs = append(incompleteUIDs, summary.UID)
 			}
 		}
-		unread := true
-		for _, f := range buf.Flags {
-			if f == imap.FlagSeen {
-				unread = false
-			}
-		}
-		out = append(out, Summary{
-			UID:     uint32(buf.UID),
-			From:    from,
-			Subject: buf.Envelope.Subject,
-			Date:    buf.Envelope.Date.Format("Jan 02"),
-			Unread:  unread,
-		})
+		out = append(out, summary)
 	}
 	if err := fetch.Close(); err != nil {
 		return out, err
 	}
-	if skipped > 0 {
-		log.Printf("fetch: skipped %d without envelope in range (sample UIDs %v)", skipped, skippedUIDs)
+	if incomplete > 0 {
+		log.Printf("fetch %d-%d: cached %d UID-only summaries (sample UIDs %v)", lo, hi, incomplete, incompleteUIDs)
 	}
 	return out, nil
+}
+
+func summaryFromBuffer(buf *imapclient.FetchMessageBuffer) (Summary, bool) {
+	if buf == nil || buf.UID == 0 {
+		return Summary{}, false
+	}
+	summary := Summary{UID: uint32(buf.UID), Unread: true}
+	for _, f := range buf.Flags {
+		if f == imap.FlagSeen {
+			summary.Unread = false
+		}
+	}
+	if buf.Envelope == nil {
+		return summary, true
+	}
+	if len(buf.Envelope.From) > 0 {
+		a := buf.Envelope.From[0]
+		summary.From = a.Name
+		if summary.From == "" {
+			summary.From = a.Addr()
+		}
+	}
+	summary.Subject = buf.Envelope.Subject
+	summary.Date = buf.Envelope.Date.Format("Jan 02")
+	return summary, true
 }
 
 // Attachment is one downloadable file (content base64, capped at 12MB each).
@@ -580,10 +591,31 @@ type Full struct {
 	UID         uint32       `json:"uid"`
 	Subject     string       `json:"subject"`
 	From        string       `json:"from"`
+	To          string       `json:"to"`
+	Cc          string       `json:"cc"`
+	Bcc         string       `json:"bcc"`
+	ReplyTo     string       `json:"replyTo"`
 	Date        string       `json:"date"`
+	MessageID   string       `json:"messageID"`
 	HTML        string       `json:"html"`
 	Text        string       `json:"text"`
 	Attachments []Attachment `json:"attachments"`
+}
+
+func formatAddresses(addrs []imap.Address) string {
+	formatted := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		email := addr.Addr()
+		if email == "" {
+			continue
+		}
+		if addr.Name != "" {
+			formatted = append(formatted, fmt.Sprintf("%s <%s>", addr.Name, email))
+		} else {
+			formatted = append(formatted, email)
+		}
+	}
+	return strings.Join(formatted, ", ")
 }
 
 // GetFull fetches + parses one message by UID (prefers HTML, falls back to text).
@@ -642,10 +674,13 @@ func getFullFrom(c *imapclient.Client, uid uint32) (*Full, error) {
 		full := &Full{UID: uint32(buf.UID)}
 		if buf.Envelope != nil {
 			full.Subject = buf.Envelope.Subject
-			if len(buf.Envelope.From) > 0 {
-				full.From = buf.Envelope.From[0].Addr()
-			}
+			full.From = formatAddresses(buf.Envelope.From)
+			full.To = formatAddresses(buf.Envelope.To)
+			full.Cc = formatAddresses(buf.Envelope.Cc)
+			full.Bcc = formatAddresses(buf.Envelope.Bcc)
+			full.ReplyTo = formatAddresses(buf.Envelope.ReplyTo)
 			full.Date = buf.Envelope.Date.Format("January 2, 3:04 PM")
+			full.MessageID = buf.Envelope.MessageID
 		}
 		html, text, atts := parseMessage(raw)
 		full.HTML, full.Text, full.Attachments = html, text, atts
@@ -682,7 +717,7 @@ func partFilename(disposition, contentType string) string {
 
 func parseMessage(raw []byte) (html, text string, atts []Attachment) {
 	entity, err := gomsg.Read(bytes.NewReader(raw))
-	if err != nil {
+	if err != nil && entity == nil {
 		return "", string(raw), nil
 	}
 	if !strings.HasPrefix(entity.Header.Get("Content-Type"), "multipart/") {

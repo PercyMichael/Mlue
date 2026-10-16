@@ -2,6 +2,15 @@
 @tailwind components;
 @tailwind utilities;
 
+.email-html img {
+  max-width: 100%;
+  height: auto;
+}
+
+.email-html table {
+  max-width: 100%;
+}
+
 html {
     background-color: #f7f6f8;
     color: #1a1a2e;

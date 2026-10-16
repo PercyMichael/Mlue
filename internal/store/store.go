@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -19,6 +20,7 @@ type Message struct {
 	Subject   string `json:"subject"`
 	Preview   string `json:"preview"`
 	Body      string `json:"body"`
+	BodyHTML  bool   `json:"bodyHTML"`
 	Date      string `json:"date"`
 	Avatar    string `json:"avatar"`
 	Unread    bool   `json:"unread"`
@@ -65,7 +67,7 @@ func (s *Store) migrate() error {
 			account TEXT, folder TEXT, uid INTEGER,
 			from_addr TEXT, from_email TEXT, to_addr TEXT,
 			subject TEXT, preview TEXT, body TEXT,
-			date_str TEXT, avatar TEXT, unread INTEGER,
+			date_str TEXT, avatar TEXT, unread INTEGER, body_html INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(account, folder, uid)
 		)`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, from_addr, preview, body)`,
@@ -78,6 +80,9 @@ func (s *Store) migrate() error {
 		if _, err := s.db.Exec(q); err != nil {
 			return err
 		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE messages ADD COLUMN body_html INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
 	}
 	return nil
 }
@@ -128,19 +133,25 @@ func (s *Store) SaveMessages(msgs []Message) error {
 	}
 	defer tx.Rollback()
 	for _, m := range msgs {
-		res, err := tx.Exec(
-			`INSERT INTO messages(account,folder,uid,from_addr,from_email,to_addr,subject,preview,body,date_str,avatar,unread)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		_, err := tx.Exec(
+			`INSERT INTO messages(account,folder,uid,from_addr,from_email,to_addr,subject,preview,body,date_str,avatar,unread,body_html)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(account,folder,uid) DO UPDATE SET unread=excluded.unread, subject=excluded.subject, preview=excluded.preview`,
-			m.Account, m.Folder, m.UID, m.From, m.FromEmail, m.To, m.Subject, m.Preview, m.Body, m.Date, m.Avatar, boolInt(m.Unread),
+			m.Account, m.Folder, m.UID, m.From, m.FromEmail, m.To, m.Subject, m.Preview, m.Body, m.Date, m.Avatar, boolInt(m.Unread), boolInt(m.BodyHTML),
 		)
 		if err != nil {
 			return err
 		}
-		id, _ := res.LastInsertId()
-		if id != 0 {
-			_, _ = tx.Exec(`INSERT INTO messages_fts(rowid,subject,from_addr,preview,body) VALUES(?,?,?,?,?)`,
-				id, m.Subject, m.From, m.Preview, m.Body)
+		var id int64
+		if err := tx.QueryRow(`SELECT id FROM messages WHERE account=? AND folder=? AND uid=?`, m.Account, m.Folder, m.UID).Scan(&id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM messages_fts WHERE rowid=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO messages_fts(rowid,subject,from_addr,preview,body) VALUES(?,?,?,?,?)`,
+			id, m.Subject, m.From, m.Preview, m.Body); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
@@ -157,13 +168,13 @@ func (s *Store) ListMessages(account, folder, query string, limit int) ([]Messag
 	var err error
 	if query == "" {
 		rows, err = s.db.Query(
-			`SELECT id,account,folder,uid,from_addr,from_email,to_addr,subject,preview,body,date_str,avatar,unread
+			`SELECT id,account,folder,uid,from_addr,from_email,to_addr,subject,preview,body,date_str,avatar,unread,body_html
 			 FROM messages WHERE account=? AND folder=? ORDER BY uid DESC LIMIT ?`,
 			account, folder, limit,
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT m.id,m.account,m.folder,m.uid,m.from_addr,m.from_email,m.to_addr,m.subject,m.preview,m.body,m.date_str,m.avatar,m.unread
+			`SELECT m.id,m.account,m.folder,m.uid,m.from_addr,m.from_email,m.to_addr,m.subject,m.preview,m.body,m.date_str,m.avatar,m.unread,m.body_html
 			 FROM messages m JOIN messages_fts f ON m.id=f.rowid
 			 WHERE m.account=? AND m.folder=? AND messages_fts MATCH ? ORDER BY m.uid DESC LIMIT ?`,
 			account, folder, query, limit,
@@ -172,7 +183,7 @@ func (s *Store) ListMessages(account, folder, query string, limit int) ([]Messag
 			// FTS syntax (quotes, *, etc.) can fail: fall back to LIKE.
 			like := "%" + query + "%"
 			rows, err = s.db.Query(
-				`SELECT id,account,folder,uid,from_addr,from_email,to_addr,subject,preview,body,date_str,avatar,unread
+				`SELECT id,account,folder,uid,from_addr,from_email,to_addr,subject,preview,body,date_str,avatar,unread,body_html
 				 FROM messages WHERE account=? AND folder=? AND (subject LIKE ? OR from_addr LIKE ? OR preview LIKE ? OR body LIKE ?)
 				 ORDER BY uid DESC LIMIT ?`,
 				account, folder, like, like, like, like, limit,
@@ -186,11 +197,12 @@ func (s *Store) ListMessages(account, folder, query string, limit int) ([]Messag
 	var out []Message
 	for rows.Next() {
 		var m Message
-		var unread int
-		if err := rows.Scan(&m.ID, &m.Account, &m.Folder, &m.UID, &m.From, &m.FromEmail, &m.To, &m.Subject, &m.Preview, &m.Body, &m.Date, &m.Avatar, &unread); err != nil {
+		var unread, bodyHTML int
+		if err := rows.Scan(&m.ID, &m.Account, &m.Folder, &m.UID, &m.From, &m.FromEmail, &m.To, &m.Subject, &m.Preview, &m.Body, &m.Date, &m.Avatar, &unread, &bodyHTML); err != nil {
 			return nil, err
 		}
 		m.Unread = unread == 1
+		m.BodyHTML = bodyHTML == 1
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -268,12 +280,46 @@ func (s *Store) Stats() (accounts, messages int, dbBytes int64) {
 	return accounts, messages, dbBytes
 }
 
-func (s *Store) UpdateBody(account, folder string, uid uint32, subject, body string) error {
+func (s *Store) CachedMessage(account, folder string, uid uint32) (*Message, error) {
+	var m Message
+	var bodyHTML int
+	err := s.db.QueryRow(`SELECT subject,from_addr,from_email,body,date_str,body_html FROM messages WHERE account=? AND folder=? AND uid=?`, account, folder, uid).
+		Scan(&m.Subject, &m.From, &m.FromEmail, &m.Body, &m.Date, &bodyHTML)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.UID, m.Account, m.Folder, m.BodyHTML = uid, account, folder, bodyHTML == 1
+	return &m, nil
+}
+
+func (s *Store) UpdateBody(account, folder string, uid uint32, subject, body string, bodyHTML bool) error {
 	preview := body
 	if len(preview) > 160 {
 		preview = preview[:160]
 	}
-	_, err := s.db.Exec(`UPDATE messages SET subject=COALESCE(NULLIF(?,''),subject), body=?, preview=? WHERE account=? AND folder=? AND uid=?`,
-		subject, body, preview, account, folder, uid)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE messages SET subject=COALESCE(NULLIF(?,''),subject), body=?, preview=?, body_html=? WHERE account=? AND folder=? AND uid=?`,
+		subject, body, preview, boolInt(bodyHTML), account, folder, uid); err != nil {
+		return err
+	}
+	var id int64
+	var indexedSubject, from, indexedPreview, indexedBody string
+	if err := tx.QueryRow(`SELECT id,subject,from_addr,preview,body FROM messages WHERE account=? AND folder=? AND uid=?`, account, folder, uid).
+		Scan(&id, &indexedSubject, &from, &indexedPreview, &indexedBody); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM messages_fts WHERE rowid=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO messages_fts(rowid,subject,from_addr,preview,body) VALUES(?,?,?,?,?)`, id, indexedSubject, from, indexedPreview, indexedBody); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
